@@ -45,9 +45,11 @@ export default function VideoChat() {
             });
             if (remoteVideoRef.current) {
                 remoteVideoRef.current.srcObject = remoteStreamRef.current;
-                remoteVideoRef.current
-                    .play()
-                    .catch((err) => console.warn("Autoplay prevented:", err));
+                remoteVideoRef.current.onloadedmetadata = () => {
+                    remoteVideoRef.current
+                        .play()
+                        .catch((err) => console.warn("Autoplay prevented:", err));
+                };
             }
             console.log("Remote track received:", e.streams[0]);
         };
