@@ -19,40 +19,39 @@ export default function VideoChat() {
     const localVideoRef = useRef(null);
     const remoteVideoRef = useRef(null);
 
-    // Refs to avoid stale-closure bugs
     const pcRef = useRef(null);
     const callRefRef = useRef(null);
-    const roleRef = useRef(null); // "caller" | "callee"
+    const roleRef = useRef(null);
     const remoteStreamRef = useRef(new MediaStream());
 
     const [callId, setCallId] = useState("");
 
-    // ---------- init PC + media ----------
-    useEffect(() => {
+    const initPeerConnection = () => {
         pcRef.current = new RTCPeerConnection(servers);
 
-        // Local media
         navigator.mediaDevices
             .getUserMedia({ video: true, audio: true })
             .then((stream) => {
-                if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+                if (localVideoRef.current) {
+                    localVideoRef.current.srcObject = stream;
+                }
                 stream.getTracks().forEach((t) => pcRef.current.addTrack(t, stream));
             })
             .catch((err) => console.error("getUserMedia error:", err));
 
-        // Remote media: merge tracks into one stream
         pcRef.current.ontrack = (e) => {
             e.streams[0].getTracks().forEach((track) => {
                 remoteStreamRef.current.addTrack(track);
             });
-            if (remoteVideoRef.current && !remoteVideoRef.current.srcObject) {
+            if (remoteVideoRef.current) {
                 remoteVideoRef.current.srcObject = remoteStreamRef.current;
-                remoteVideoRef.current.play().catch(() => { });
+                remoteVideoRef.current
+                    .play()
+                    .catch((err) => console.warn("Autoplay prevented:", err));
             }
             console.log("Remote track received:", e.streams[0]);
         };
 
-        // ICE: write to correct subcollection based on role
         pcRef.current.onicecandidate = async (event) => {
             if (!event.candidate) return;
             const callRef = callRefRef.current;
@@ -63,22 +62,39 @@ export default function VideoChat() {
                 role === "caller" ? "offerCandidates" : "answerCandidates";
             try {
                 await addDoc(collection(callRef, bucket), event.candidate.toJSON());
-                console.log("ICE candidate saved →", bucket, event.candidate.type);
+                console.log("ICE candidate saved →", bucket);
             } catch (e) {
                 console.error("Failed to save ICE candidate:", e);
             }
         };
+    };
 
-        return () => {
-            // cleanup if component unmounts
-            try {
-                pcRef.current?.getSenders()?.forEach((s) => s.track?.stop());
-                pcRef.current?.close();
-            } catch { }
-        };
+    const cleanup = () => {
+        try {
+            pcRef.current?.getSenders()?.forEach((s) => s.track?.stop());
+            pcRef.current?.close();
+        } catch { }
+
+        remoteStreamRef.current = new MediaStream();
+        if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = null;
+        }
+        if (localVideoRef.current) {
+            localVideoRef.current.srcObject = null;
+        }
+
+        roleRef.current = null;
+        callRefRef.current?._unsubs?.forEach((u) => u && u());
+        callRefRef.current = null;
+        setCallId("");
+        initPeerConnection();
+    };
+
+    useEffect(() => {
+        initPeerConnection();
+        return cleanup;
     }, []);
 
-    // ---------- create call (caller) ----------
     const createCall = async () => {
         roleRef.current = "caller";
 
@@ -89,7 +105,7 @@ export default function VideoChat() {
 
         const pc = pcRef.current;
 
-        // Listen for callee ICE
+        // Listen for answer candidates
         const answerCandsRef = collection(callRef, "answerCandidates");
         const stopAnswerCand = onSnapshot(answerCandsRef, (snap) => {
             snap.docChanges().forEach((change) => {
@@ -102,14 +118,13 @@ export default function VideoChat() {
             });
         });
 
-        // Offer
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         console.log("Offer created:", offer);
 
         await setDoc(callRef, { offer: { type: offer.type, sdp: offer.sdp } });
 
-        // Wait for answer
+        // Listen for remote answer or hangup
         const stopCallDoc = onSnapshot(callRef, (snap) => {
             const data = snap.data();
             if (data?.answer && !pc.currentRemoteDescription) {
@@ -117,13 +132,15 @@ export default function VideoChat() {
                     (e) => console.error("setRemoteDescription(answer) failed:", e)
                 );
             }
+            if (data?.type === "hangup") {
+                console.log("Remote peer hung up");
+                cleanup();
+            }
         });
 
-        // store unsubscribers on the ref so we can clean later if needed
         callRefRef.current._unsubs = [stopAnswerCand, stopCallDoc];
     };
 
-    // ---------- join call (callee) ----------
     const joinCall = async () => {
         if (!callId) return alert("Enter Call ID to join");
 
@@ -134,7 +151,6 @@ export default function VideoChat() {
 
         const pc = pcRef.current;
 
-        // Read offer
         const callSnap = await getDoc(callRef);
         const data = callSnap.data();
         if (!data?.offer) {
@@ -143,7 +159,6 @@ export default function VideoChat() {
         }
         await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
 
-        // Answer
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         console.log("Answer created:", answer);
@@ -154,7 +169,7 @@ export default function VideoChat() {
             { merge: true }
         );
 
-        // Listen for caller ICE
+        // Listen for offer ICE candidates
         const offerCandsRef = collection(callRef, "offerCandidates");
         const stopOfferCand = onSnapshot(offerCandsRef, (snap) => {
             snap.docChanges().forEach((change) => {
@@ -167,23 +182,24 @@ export default function VideoChat() {
             });
         });
 
-        callRefRef.current._unsubs = [stopOfferCand];
+        // Listen for hangup
+        const stopCallDoc = onSnapshot(callRef, (snap) => {
+            const newData = snap.data();
+            if (newData?.type === "hangup") {
+                console.log("Remote peer hung up");
+                cleanup();
+            }
+        });
+
+        callRefRef.current._unsubs = [stopOfferCand, stopCallDoc];
     };
 
-    // ---------- hang up / cleanup ----------
     const hangUp = async () => {
-        try {
-            pcRef.current.getSenders().forEach((s) => s.track?.stop());
-            pcRef.current.close();
-        } catch { }
-        // (optional) delete doc/collections in Firestore here if you want
-        // await deleteDoc(callRefRef.current)
-        roleRef.current = null;
-        callRefRef.current?._unsubs?.forEach((u) => u && u());
-        callRefRef.current = null;
-        setCallId("");
-        // Recreate a new RTCPeerConnection for next call
-        pcRef.current = new RTCPeerConnection(servers);
+        // Notify remote peer
+        if (callRefRef.current) {
+            await setDoc(callRefRef.current, { type: "hangup" }, { merge: true });
+        }
+        cleanup();
     };
 
     return (
@@ -196,13 +212,23 @@ export default function VideoChat() {
                     autoPlay
                     playsInline
                     muted
-                    style={{ width: 320, height: "auto", border: "1px solid #ddd", borderRadius: 8 }}
+                    style={{
+                        width: 320,
+                        height: "auto",
+                        border: "1px solid #ddd",
+                        borderRadius: 8,
+                    }}
                 />
                 <video
                     ref={remoteVideoRef}
                     autoPlay
                     playsInline
-                    style={{ width: 320, height: "auto", border: "1px solid #ddd", borderRadius: 8 }}
+                    style={{
+                        width: 320,
+                        height: "auto",
+                        border: "1px solid #ddd",
+                        borderRadius: 8,
+                    }}
                 />
             </div>
 
